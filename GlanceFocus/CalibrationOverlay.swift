@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import Combine
 
-/// Kalibratsiya paytida tanlangan monitorni qoraytirib, markazda qizil nuqta ko'rsatadi.
+/// During calibration, dims the selected display and shows a red dot in its center.
 final class CalibrationOverlay {
     private var window: NSWindow?
     private let model = OverlayModel()

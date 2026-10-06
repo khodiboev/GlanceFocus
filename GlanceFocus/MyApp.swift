@@ -7,7 +7,7 @@ struct GlanceFocusApp: App {
     @StateObject private var controller = FocusController()
 
     var body: some Scene {
-        // Dock'da ko'rinmaydi, faqat yuqoridagi menu bar'da ko'z belgisi turadi
+        // No Dock icon: the app lives in the menu bar as an eye icon
         MenuBarExtra {
             MenuContent(controller: controller)
         } label: {
@@ -25,20 +25,27 @@ struct MenuContent: View {
 
         Divider()
 
-        Toggle("Yoqilgan", isOn: $controller.isEnabled)
+        Toggle("Enabled", isOn: $controller.isEnabled)
 
-        Button("Kalibrlash…") { controller.startCalibration() }
+        Button("Calibrate…") { controller.startCalibration() }
             .disabled(controller.isCalibrating)
 
-        Picker("Tezlik", selection: $controller.speed) {
+        Picker("Speed", selection: $controller.speed) {
             ForEach(Speed.allCases) { speed in
                 Text(speed.title).tag(speed)
             }
         }
 
-        Toggle("Oxirgi joyga qaytish (markaz o'rniga)", isOn: $controller.rememberPosition)
+        Divider()
 
-        Toggle("Kompyuter yonganda avtomatik ishga tushsin", isOn: $launchAtLogin)
+        Toggle("Move cursor", isOn: $controller.moveCursor)
+        Toggle("Frosted glass ❄️", isOn: $controller.frostEnabled)
+        Toggle("Return to last cursor position", isOn: $controller.rememberPosition)
+            .disabled(!controller.moveCursor)
+
+        Divider()
+
+        Toggle("Launch at login", isOn: $launchAtLogin)
             .onChange(of: launchAtLogin) { newValue in
                 do {
                     if newValue {
@@ -53,7 +60,7 @@ struct MenuContent: View {
 
         Divider()
 
-        Button("Chiqish") { NSApp.terminate(nil) }
+        Button("Quit") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
     }
 }

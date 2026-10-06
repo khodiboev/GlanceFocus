@@ -5,10 +5,10 @@ import Combine
 
 struct DisplayInfo {
     let id: CGDirectDisplayID
-    let bounds: CGRect   // global koordinatalar, chap-yuqori burchak = (0,0)
+    let bounds: CGRect   // global coordinates, top-left corner = (0,0)
 }
 
-/// Sakrash tezligi: tezroq = sezgirroq, lekin tasodifiy sakrashlar ehtimoli ko'proq
+/// Reaction speed: faster = more responsive, but more likely to jump by accident
 enum Speed: String, CaseIterable, Identifiable {
     case slow, medium, fast, predictive
 
@@ -16,19 +16,19 @@ enum Speed: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .slow: return "Sekin (eng barqaror)"
-        case .medium: return "O'rta"
-        case .fast: return "Tez"
-        case .predictive: return "Juda tez (bashoratli)"
+        case .slow: return "Slow (most stable)"
+        case .medium: return "Medium"
+        case .fast: return "Fast"
+        case .predictive: return "Very fast (predictive)"
         }
     }
 
     struct Params {
-        let fps: Double        // sekundiga nechta kadr tahlil qilinadi
-        let smooth: Int        // signal nechta kadr bo'yicha o'rtachalanadi
-        let stable: Double     // nigoh shuncha soniya barqaror bo'lsa sakraydi
-        let idle: Double       // sichqoncha shuncha soniya tinch tursa sakraydi
-        let predict: Bool      // bosh burilishini oldindan sezib sakrash
+        let fps: Double        // camera frames analyzed per second
+        let smooth: Int        // number of frames the signal is averaged over
+        let stable: Double     // gaze must stay stable this long (s) before switching
+        let idle: Double       // mouse must be idle this long (s) before the cursor moves
+        let predict: Bool      // switch early when a head turn is detected
     }
 
     var params: Params {
@@ -43,9 +43,9 @@ enum Speed: String, CaseIterable, Identifiable {
 
 final class FocusController: NSObject, ObservableObject {
 
-    // MARK: - UI holati (main thread)
+    // MARK: - UI state (main thread)
 
-    @Published var statusText = "Ishga tushmoqda…"
+    @Published var statusText = "Starting…"
 
     @Published var isEnabled: Bool = UserDefaults.standard.object(forKey: Keys.enabled) as? Bool ?? true {
         didSet {
@@ -74,6 +74,30 @@ final class FocusController: NSObject, ObservableObject {
         }
     }
 
+    @Published var moveCursor: Bool = UserDefaults.standard.object(forKey: Keys.moveCursor) as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(moveCursor, forKey: Keys.moveCursor)
+            let value = moveCursor
+            videoQueue.async { self.t.moveCursor = value }
+        }
+    }
+
+    @Published var frostEnabled: Bool = UserDefaults.standard.object(forKey: Keys.frost) as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(frostEnabled, forKey: Keys.frost)
+            let value = frostEnabled
+            if !value { frostOverlay.hideAll() }
+            videoQueue.async {
+                self.t.frost = value
+                // When turned on, immediately frost every screen except the one you're looking at
+                if value, let gaze = self.t.gaze, gaze < self.t.displays.count {
+                    let id = self.t.displays[gaze].id
+                    DispatchQueue.main.async { self.frostOverlay.focus(on: id) }
+                }
+            }
+        }
+    }
+
     @Published private(set) var isCalibrating = false
 
     private enum Keys {
@@ -81,28 +105,31 @@ final class FocusController: NSObject, ObservableObject {
         static let remember = "rememberPosition"
         static let centers = "centers"
         static let speed = "speed"
+        static let moveCursor = "moveCursor"
+        static let frost = "frostEnabled"
     }
 
-    // MARK: - Sozlamalar
+    // MARK: - Settings
 
-    // Tezlik bilan bog'liq sozlamalar Speed enum ichida (menyudan tanlanadi)
+    // Speed-related settings live in the Speed enum (chosen from the menu)
 
-    // Bashorat "murvatlari" — keraksiz sakrashlar bo'lsa, shu 4 ta raqamni oshiring
-    private let predictMinProgress = 0.55   // bosh yo'lning kamida 55% ini bosib o'tishi kerak
-    private let predictSpeedFactor = 1.8    // burilish tezligi: butun yo'lni ~0.55 s da bosib o'tadigan darajada
-    private let predictFrames = 3           // shart ketma-ket shuncha kadr bajarilishi kerak (~0.1 s)
-    private let predictCooldown = 0.4       // ikki bashorat orasidagi minimal tanaffus (soniya)
+    // Prediction tuning: if you get unwanted jumps, increase these four values
+    private let predictMinProgress = 0.55   // head must have covered at least 55% of the way
+    private let predictSpeedFactor = 1.8    // turn speed: fast enough to cover the whole way in ~0.55 s
+    private let predictFrames = 3           // condition must hold for this many frames in a row (~0.1 s)
+    private let predictCooldown = 0.4       // minimum pause between two predictions (s)
     private let calibrationSeconds: UInt64 = 2
 
-    // MARK: - Kamera va monitorlar (main thread)
+    // MARK: - Camera and displays (main thread)
 
     private let session = AVCaptureSession()
     private let videoQueue = DispatchQueue(label: "glancefocus.video")
     private var cameraReady = false
     private var displays: [DisplayInfo] = []
     private var centers: [Double?] = []
+    private let frostOverlay = FrostOverlay()
 
-    // MARK: - Kuzatuv holati (faqat videoQueue ichida ishlatiladi)
+    // MARK: - Tracking state (only used on videoQueue)
 
     private struct TrackingState {
         var displays: [DisplayInfo] = []
@@ -110,6 +137,9 @@ final class FocusController: NSObject, ObservableObject {
         var hysteresis = 3.0
         var rememberPosition = false
         var params = Speed.fast.params
+        var moveCursor = true
+        var frost = true
+        var gaze: Int? = nil                 // the screen you're looking at (stable decision)
         var calibrating = false
         var calibrationSamples: [Double]? = nil
         var buffer: [Double] = []
@@ -119,7 +149,7 @@ final class FocusController: NSObject, ObservableObject {
         var lastMouseMove = 0.0
         var lastFrame = 0.0
         var lastPositions: [CGDirectDisplayID: CGPoint] = [:]
-        var history: [(time: Double, value: Double)] = []   // bashorat uchun so'nggi signallar
+        var history: [(time: Double, value: Double)] = []   // recent signals used for prediction
         var lastPredictiveJump = 0.0
         var predictCandidate: Int? = nil
         var predictStreak = 0
@@ -128,29 +158,31 @@ final class FocusController: NSObject, ObservableObject {
 
     private let faceRequest: VNDetectFaceRectanglesRequest = {
         let r = VNDetectFaceRectanglesRequest()
-        r.revision = VNDetectFaceRectanglesRequestRevision3   // uzluksiz yaw/pitch/roll
+        r.revision = VNDetectFaceRectanglesRequestRevision3   // continuous yaw/pitch/roll
         return r
     }()
 
     private let landmarksRequest: VNDetectFaceLandmarksRequest = {
         let r = VNDetectFaceLandmarksRequest()
-        r.revision = VNDetectFaceLandmarksRequestRevision3    // ko'z qorachig'i nuqtalari
+        r.revision = VNDetectFaceLandmarksRequestRevision3    // pupil landmarks
         return r
     }()
 
-    // MARK: - Hayot sikli
+    // MARK: - Lifecycle
 
     override init() {
         super.init()
         t.rememberPosition = rememberPosition
         t.params = speed.params
+        t.moveCursor = moveCursor
+        t.frost = frostEnabled
         reloadDisplays()
 
         NotificationCenter.default.addObserver(
             self, selector: #selector(screensChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
-        // Uyqu / qulf paytida kamerani o'chiramiz (maxfiylik + batareya)
+        // Turn the camera off while the Mac sleeps or is locked (privacy + battery)
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(self, selector: #selector(pause), name: NSWorkspace.willSleepNotification, object: nil)
         ws.addObserver(self, selector: #selector(resume), name: NSWorkspace.didWakeNotification, object: nil)
@@ -166,7 +198,7 @@ final class FocusController: NSObject, ObservableObject {
         case .authorized:
             if !cameraReady { setupCamera() }
             runSession(true)
-            // Birinchi ishga tushishda kalibratsiya avtomatik boshlanadi
+            // Calibration starts automatically on first launch
             if cameraReady, displays.count >= 2, centers.contains(where: { $0 == nil }) {
                 startCalibration()
             }
@@ -182,6 +214,8 @@ final class FocusController: NSObject, ObservableObject {
 
     private func stop() {
         runSession(false)
+        frostOverlay.hideAll()
+        videoQueue.async { self.t.gaze = nil; self.t.candidate = nil }
         updateStatus()
     }
 
@@ -210,11 +244,15 @@ final class FocusController: NSObject, ObservableObject {
         }
     }
 
-    @objc private func pause() { runSession(false) }
+    @objc private func pause() {
+        runSession(false)
+        frostOverlay.hideAll()
+        videoQueue.async { self.t.gaze = nil; self.t.candidate = nil }
+    }
     @objc private func resume() { if isEnabled { runSession(true) } }
     @objc private func screensChanged() { reloadDisplays() }
 
-    // MARK: - Monitorlar
+    // MARK: - Displays
 
     private func reloadDisplays() {
         var count: UInt32 = 0
@@ -225,6 +263,7 @@ final class FocusController: NSObject, ObservableObject {
         displays = ids.prefix(Int(count)).map { DisplayInfo(id: $0, bounds: CGDisplayBounds($0)) }
         let saved = UserDefaults.standard.dictionary(forKey: Keys.centers) as? [String: Double] ?? [:]
         centers = displays.map { saved[String($0.id)] }
+        frostOverlay.rebuild(displayIDs: displays.map { $0.id })
 
         pushStateToVideoQueue()
         updateStatus()
@@ -249,37 +288,39 @@ final class FocusController: NSObject, ObservableObject {
             self.t.history.removeAll()
             self.t.predictStreak = 0
             self.t.candidate = nil
+            self.t.gaze = nil
         }
     }
 
     private func updateStatus() {
         let auth = AVCaptureDevice.authorizationStatus(for: .video)
         if auth == .denied || auth == .restricted {
-            statusText = "Kameraga ruxsat yo'q → System Settings › Privacy › Camera"
+            statusText = "No camera access → System Settings › Privacy › Camera"
         } else if auth == .authorized && !cameraReady {
-            statusText = "Kamera topilmadi"
+            statusText = "No camera found"
         } else if !isEnabled {
-            statusText = "O'chirilgan"
+            statusText = "Paused"
         } else if isCalibrating {
-            statusText = "Kalibrlanmoqda…"
+            statusText = "Calibrating…"
         } else if displays.count < 2 {
-            statusText = "Kutilmoqda: 2-monitor ulanmagan"
+            statusText = "Waiting for a second monitor"
         } else if centers.contains(where: { $0 == nil }) {
-            statusText = "Kalibrlash kerak"
+            statusText = "Calibration needed"
         } else {
-            statusText = "Ishlayapti — \(displays.count) ta monitor"
+            statusText = "Running on \(displays.count) monitors"
         }
     }
 
-    // MARK: - Kalibratsiya
+    // MARK: - Calibration
 
     func startCalibration() {
         guard !isCalibrating else { return }
         reloadDisplays()
-        guard displays.count >= 2 else { statusText = "Kamida 2 ta monitor kerak"; return }
+        guard displays.count >= 2 else { statusText = "At least 2 monitors are needed"; return }
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { updateStatus(); return }
 
         isCalibrating = true
+        frostOverlay.hideAll()
         if !isEnabled { isEnabled = true } else { if !cameraReady { setupCamera() }; runSession(true) }
         guard cameraReady else { isCalibrating = false; updateStatus(); return }
         updateStatus()
@@ -296,11 +337,11 @@ final class FocusController: NSObject, ObservableObject {
                 self.warp(to: CGPoint(x: d.bounds.midX, y: d.bounds.midY))
 
                 for n in stride(from: 3, through: 1, by: -1) {
-                    overlay.setText("Qizil nuqtaga qarang\n\(n)")
+                    overlay.setText("Look at the red dot\n\(n)")
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
 
-                overlay.setText("Qarab turing…")
+                overlay.setText("Keep looking…")
                 self.videoQueue.sync { self.t.calibrationSamples = [] }
                 try? await Task.sleep(nanoseconds: self.calibrationSeconds * 1_000_000_000)
                 let samples: [Double] = self.videoQueue.sync {
@@ -324,7 +365,7 @@ final class FocusController: NSObject, ObservableObject {
             self.isCalibrating = false
             self.reloadDisplays()
             if failed {
-                self.statusText = "Yuz ko'rinmadi — yorug'likni tekshirib, qayta kalibrlang"
+                self.statusText = "Face not detected. Check the lighting and calibrate again"
             }
         }
     }
@@ -334,16 +375,16 @@ final class FocusController: NSObject, ObservableObject {
         return s[s.count / 2]
     }
 
-    // MARK: - Sichqoncha
+    // MARK: - Cursor
 
     private func warp(to point: CGPoint) {
         CGWarpMouseCursorPosition(point)
-        CGAssociateMouseAndMouseCursorPosition(1)   // warp'dan keyin kursor qotib qolmasin
+        CGAssociateMouseAndMouseCursorPosition(1)   // keep the cursor from freezing after a warp
     }
 
-    // MARK: - Nigoh signali (videoQueue)
+    // MARK: - Gaze signal (videoQueue)
 
-    /// Bosh burilishi (gradus) + ko'z qorachig'i siljishi. Yuz yo'q bo'lsa nil.
+    /// Head turn (degrees) + pupil offset. Returns nil when no face is found.
     private func measure(_ pixelBuffer: CVPixelBuffer) -> Double? {
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         do {
@@ -364,7 +405,7 @@ final class FocusController: NSObject, ObservableObject {
         return signal
     }
 
-    /// Qorachiq ko'z ichida qayerda: -0.5 (bir chet) … +0.5 (boshqa chet)
+    /// Where the pupil sits inside the eye: -0.5 (one edge) … +0.5 (other edge)
     private func pupilOffset(_ lm: VNFaceLandmarks2D) -> Double? {
         func ratio(_ eye: VNFaceLandmarkRegion2D?, _ pupil: VNFaceLandmarkRegion2D?) -> Double? {
             guard let eye, let pupil, let p = pupil.normalizedPoints.first else { return nil }
@@ -380,7 +421,7 @@ final class FocusController: NSObject, ObservableObject {
     private func track(signal: Double?, now: Double) {
         guard t.displays.count >= 2 else { return }
 
-        // Foydalanuvchi sichqonchani o'zi qimirlatyaptimi?
+        // Is the user moving the mouse right now?
         let mouse = CGEvent(source: nil)?.location ?? .zero
         if hypot(mouse.x - t.lastMouse.x, mouse.y - t.lastMouse.y) > 2 {
             t.lastMouseMove = now
@@ -404,27 +445,30 @@ final class FocusController: NSObject, ObservableObject {
         if t.buffer.count > t.params.smooth { t.buffer.removeFirst() }
         let avg = t.buffer.reduce(0, +) / Double(t.buffer.count)
 
-        // Eng yaqin kalibratsiya qiymati + gisterezis (titrashga qarshi)
+        // Closest calibrated screen + hysteresis (prevents flicker)
         let dists = t.centers.map { abs(avg - $0) }
         guard var target = dists.indices.min(by: { dists[$0] < dists[$1] }) else { return }
-        if let current, target != current, dists[current] - dists[target] < t.hysteresis {
-            target = current
+        let reference = t.gaze ?? current      // last decision (or the screen the cursor is on)
+        if let reference, target != reference, dists[reference] - dists[target] < t.hysteresis {
+            target = reference
         }
 
-        // Bashorat: bosh boshqa monitor tomon tez va ishonchli burilyapti
-        if t.params.predict, let current,
-           now - t.lastMouseMove >= t.params.idle,
+        // Prediction: the head is turning quickly and clearly toward another screen
+        if t.params.predict, let reference,
            now - t.lastPredictiveJump >= predictCooldown {
-            if let predicted = predictedTarget(current: current, signal: avg, now: now) {
+            if let predicted = predictedTarget(current: reference, signal: avg, now: now) {
                 if predicted == t.predictCandidate {
                     t.predictStreak += 1
                 } else {
                     t.predictCandidate = predicted
                     t.predictStreak = 1
                 }
-                // Bitta tasodifiy "sakrash"ga emas, ketma-ket bir necha kadrga ishonamiz
+                // Trust several frames in a row, not a single noisy spike
                 if t.predictStreak >= predictFrames {
-                    jump(to: predicted)
+                    setGaze(predicted)
+                    if t.moveCursor, predicted != current, now - t.lastMouseMove >= t.params.idle {
+                        jump(to: predicted)
+                    }
                     t.lastPredictiveJump = now
                     t.predictStreak = 0
                     t.predictCandidate = nil
@@ -438,20 +482,32 @@ final class FocusController: NSObject, ObservableObject {
             }
         }
 
-        // Barqarorlik: bir xil qaror params.stable soniya davom etishi kerak
+        // Stability: the same decision must hold for params.stable seconds
         if target != t.candidate {
             t.candidate = target
             t.candidateSince = now
             return
         }
-        guard now - t.candidateSince >= t.params.stable,
-              target != current,
-              now - t.lastMouseMove >= t.params.idle else { return }
+        guard now - t.candidateSince >= t.params.stable else { return }
 
-        jump(to: target)
+        // 1) Gaze decision changed → update the frosted glass
+        if t.gaze != target { setGaze(target) }
+
+        // 2) Move the cursor (if enabled and the user isn't using the mouse)
+        if t.moveCursor, target != current, now - t.lastMouseMove >= t.params.idle {
+            jump(to: target)
+        }
     }
 
-    /// Sichqonchani tanlangan monitorga o'tkazadi (videoQueue)
+    /// Stores the new gaze decision and updates the frosted glass (videoQueue)
+    private func setGaze(_ index: Int) {
+        t.gaze = index
+        guard t.frost else { return }
+        let id = t.displays[index].id
+        DispatchQueue.main.async { self.frostOverlay.focus(on: id) }
+    }
+
+    /// Moves the cursor to the given screen (videoQueue)
     private func jump(to index: Int) {
         let d = t.displays[index]
         let point = (t.rememberPosition ? t.lastPositions[d.id] : nil)
@@ -460,11 +516,11 @@ final class FocusController: NSObject, ObservableObject {
         t.lastMouse = point
     }
 
-    /// Bosh qaysi monitor tomon tez burilayotganini aniqlaydi. Aniq bo'lmasa nil.
+    /// Detects which screen the head is quickly turning toward. Returns nil when unsure.
     private func predictedTarget(current: Int, signal: Double, now: Double) -> Int? {
-        // So'nggi 0.15 soniyadagi nuqtalar bo'yicha "eng yaxshi to'g'ri chiziq" qiyaligi = tezlik.
-        // Ikki nuqta orasidagi farqdan ko'ra ancha barqaror: ko'zning tez pirpirashi kabi
-        // bitta shovqinli kadr natijani buzmaydi.
+        // Velocity = slope of the best-fit line through the last 0.15 s of samples.
+        // Much more stable than the difference between two points: a single noisy frame,
+        // like a quick eye movement, can't ruin the result.
         let window = t.history.filter { now - $0.time <= 0.15 }
         guard window.count >= 4 else { return nil }
         let n = Double(window.count)
@@ -476,15 +532,15 @@ final class FocusController: NSObject, ObservableObject {
             den += (p.time - meanT) * (p.time - meanT)
         }
         guard den > 0 else { return nil }
-        let velocity = num / den   // birlik/soniya
+        let velocity = num / den   // units per second
 
         let start = t.centers[current]
         for j in t.centers.indices where j != current {
             let span = t.centers[j] - start
             guard abs(span) > 1 else { continue }
 
-            let progress = (signal - start) / span                // 0 = joriy monitor, 1 = maqsad
-            let towardSpeed = span > 0 ? velocity : -velocity      // maqsad tomon tezlik
+            let progress = (signal - start) / span                // 0 = current screen, 1 = target
+            let towardSpeed = span > 0 ? velocity : -velocity      // speed toward the target
             let minSpeed = max(30.0, abs(span) * predictSpeedFactor)
 
             if progress >= predictMinProgress, progress < 1.5, towardSpeed >= minSpeed {
@@ -495,7 +551,7 @@ final class FocusController: NSObject, ObservableObject {
     }
 }
 
-// MARK: - Kamera kadrlari
+// MARK: - Camera frames
 
 extension FocusController: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput,
