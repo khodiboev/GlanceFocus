@@ -2,13 +2,14 @@
 
 **Look at a monitor — your cursor follows.**
 
-Glance Focus is a tiny macOS menu bar app for multi-monitor setups. It uses your Mac's built-in camera to see which screen you're looking at and instantly moves the mouse cursor to that screen. No more dragging the cursor across two huge displays.
+Glance Focus is a tiny macOS menu bar app for multi-monitor setups. It uses your Mac's built-in camera to see which screen you're looking at, moves the mouse cursor to that screen, and can frost the screens you're not looking at so you stay focused.
 
 <!-- Demo: add a GIF here, e.g. ![demo](docs/demo.gif) -->
 
 ## Features
 
 - **Hands-free screen switching.** Turn your head toward a monitor and the cursor jumps there.
+- **Frosted glass ❄️.** Screens you're not looking at blur like a frozen window and thaw the moment you look back. Use it together with cursor switching or on its own.
 - **Four speed modes.** Choose between Slow (most stable), Medium, Fast, and Very fast (predictive). The predictive mode moves the cursor *before* your head finishes turning.
 - **One-time calibration.** Look at a red dot on each screen for 2 seconds. Calibration is saved and reused.
 - **Launch at login.** Turn it on once and forget about it.
@@ -32,7 +33,7 @@ Glance Focus is a tiny macOS menu bar app for multi-monitor setups. It uses your
 4. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to GlanceFocus.
 5. Click **Allow** when the app asks for camera access.
 6. Follow the calibration: look at the red dot on each screen until it disappears.
-7. Click the 👁 icon in the menu bar and enable **"Kompyuter yonganda avtomatik ishga tushsin"** (launch at login).
+7. Click the 👁 icon in the menu bar and turn on **Launch at login**.
 
 If **Open Anyway** doesn't appear, run this in Terminal and open the app again:
 
@@ -64,17 +65,19 @@ Click the 👁 icon in the menu bar to open the menu:
 
 | Menu item | What it does |
 |---|---|
-| Yoqilgan | Turn tracking on/off |
-| Kalibrlash… | Run calibration again |
-| Tezlik | Speed mode: Sekin / O'rta / Tez / Juda tez (bashoratli) |
-| Oxirgi joyga qaytish | Jump to the last cursor position instead of the screen center |
-| Kompyuter yonganda avtomatik ishga tushsin | Launch at login |
-| Chiqish | Quit |
+| Enabled | Turn tracking on or off |
+| Calibrate… | Run calibration again |
+| Speed | Slow (most stable), Medium, Fast, or Very fast (predictive) |
+| Move cursor | Move the cursor to the screen you look at |
+| Frosted glass ❄️ | Blur the screens you're not looking at |
+| Return to last cursor position | Jump back to where the cursor was on that screen instead of its center |
+| Launch at login | Start Glance Focus automatically |
+| Quit | Quit the app |
 
 **Tips**
 
 - Run calibration again if you change your seating position, move the camera, or rearrange your monitors.
-- If the cursor jumps when you don't want it to, switch to **Tez** or **O'rta**.
+- If the cursor jumps when you don't want it to, switch to **Fast** or **Medium**.
 - The app won't move the cursor while you are actively using the mouse.
 
 ## How it works
@@ -83,7 +86,7 @@ Click the 👁 icon in the menu bar to open the menu:
 2. **Calibration.** While you look at each screen, the app records your typical head/eye "signal" for that screen.
 3. **Decision.** In every frame, the app picks the screen whose calibrated signal is closest to the current one. Smoothing, hysteresis and a short stability window prevent jitter.
 4. **Prediction (optional).** In the predictive mode, the app estimates how fast your head is turning. If you're clearly turning toward another screen and are past about 55% of the way, it moves the cursor early.
-5. **Cursor move.** The cursor is moved with `CGWarpMouseCursorPosition`.
+5. **Action.** The cursor is moved with `CGWarpMouseCursorPosition`, and the other screens are covered with a click-through `NSVisualEffectView` that blurs whatever is behind it.
 
 Prediction can be tuned in `FocusController.swift` using `predictMinProgress`, `predictSpeedFactor`, `predictFrames` and `predictCooldown`.
 
@@ -92,10 +95,11 @@ Prediction can be tuned in `FocusController.swift` using `predictMinProgress`, `
 | Problem | Fix |
 |---|---|
 | Cursor doesn't move | System Settings → Privacy & Security → **Accessibility** → enable GlanceFocus |
-| "Kameraga ruxsat yo'q" in the menu | System Settings → Privacy & Security → **Camera** → enable GlanceFocus |
-| Calibration fails ("Yuz ko'rinmadi") | Improve the lighting and make sure your face is visible to the camera |
-| Wrong screen is chosen | Run **Kalibrlash…** again from your normal sitting position |
-| Unwanted jumps | Use **Tez** instead of **Juda tez (bashoratli)** |
+| "No camera access" in the menu | System Settings → Privacy & Security → **Camera** → enable GlanceFocus |
+| Calibration fails ("Face not detected") | Improve the lighting and make sure your face is visible to the camera |
+| Wrong screen is chosen | Run **Calibrate…** again from your normal sitting position |
+| Unwanted jumps | Use **Fast** instead of **Very fast (predictive)** |
+| Text is still readable through the frost | The blur strength depends on macOS; see `FrostOverlay.swift` to tune the frost layer |
 
 ## Project structure
 
@@ -103,23 +107,9 @@ Prediction can be tuned in `FocusController.swift` using `predictMinProgress`, `
 GlanceFocus/
 ├── MyApp.swift              # App entry point + menu bar UI
 ├── FocusController.swift    # Camera, Vision tracking, calibration, prediction, cursor control
-└── CalibrationOverlay.swift # Full-screen calibration overlay with the red dot
+├── CalibrationOverlay.swift # Full-screen calibration overlay with the red dot
+└── FrostOverlay.swift       # Frosted glass effect for the screens you're not looking at
 ```
-
----
-
-## 🇺🇿 O'zbekcha qisqacha
-
-**Glance Focus** — qaysi monitorga qarasangiz, sichqoncha o'sha monitorga o'tadi. Ilova Mac kamerasi orqali boshingiz qaysi tomonga burilganini aniqlaydi.
-
-**O'rnatish:**
-1. [Releases](../../releases) sahifasidan `GlanceFocus.zip` ni yuklab oling va `GlanceFocus.app` ni Applications papkasiga o'tkazing.
-2. Ilovani oching va "Apple tekshira olmadi" degan ogohlantirish chiqqanda **Done** ni bosing.
-3. System Settings → Privacy & Security → pastga tushing → **Open Anyway** ni bosing.
-4. Kameraga ruxsat bering va har bir monitordagi qizil nuqtaga qarab kalibratsiyadan o'ting.
-5. Menu bar'dagi 👁 → "Kompyuter yonganda avtomatik ishga tushsin" ni belgilang.
-
-Hamma hisob-kitob kompyuterning o'zida bajariladi: internetga hech narsa yuborilmaydi, rasmlar saqlanmaydi.
 
 ## License
 
